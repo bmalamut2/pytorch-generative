@@ -36,7 +36,7 @@ class GatedPixelCNNLayer(nn.Module):
     the skip connection to the pre-logits layer.
     """
 
-    def __init__(self, in_channels, out_channels, kernel_size=3, mask_center=False):
+    def __init__(self, in_channels, out_channels, kernel_size=3, mask_center=False, shift_link_only=False):
         """Initializes a new GatedPixelCNNLayer instance.
 
         Args:
@@ -47,6 +47,7 @@ class GatedPixelCNNLayer(nn.Module):
                 center pixel is masked out so the computation only depends on pixels to
                 the left and above. The residual connection in the horizontal stack is
                 also removed.
+            shift_link_only: Gated PixelCNN blind spot fix
         """
         super().__init__()
 
@@ -58,6 +59,7 @@ class GatedPixelCNNLayer(nn.Module):
         self._kernel_size = kernel_size
         self._padding = (kernel_size - 1) // 2  # (kernel_size - stride) / 2
         self._mask_center = mask_center
+        self._shift_link_only = shift_link_only
 
         # Vertical stack convolutions.
         self._vstack_1xN = nn.Conv2d(
@@ -70,12 +72,23 @@ class GatedPixelCNNLayer(nn.Module):
         # instead of adding extra padding to the convolution? When we add extra
         # padding, the cropped output rows will no longer line up with the rows of
         # the vstack_1x1 output.
-        self._vstack_Nx1 = nn.Conv2d(
-            in_channels=self._out_channels,
-            out_channels=2 * self._out_channels,
-            kernel_size=(self._kernel_size // 2 + 1, 1),
-            padding=(self._padding + 1, 0),
-        )
+        
+        # fix: the original code (shift_link_only false) does the shift down in every layer within the vertical stack. the correct implementation only does the shift down when the copy is passed from the vertical stack to the horizontal stack.
+        # (the fix also resolves the original author's above comment, because it removes the extra padding he described)
+        if self._shift_link_only:
+            self._vstack_Nx1 = nn.Conv2d(
+                in_channels=self._out_channels,
+                out_channels=2 * self._out_channels,
+                kernel_size=(self._kernel_size // 2 + 1, 1),
+                padding=(self._padding, 0),
+            )
+        else:
+            self._vstack_Nx1 = nn.Conv2d(
+                in_channels=self._out_channels,
+                out_channels=2 * self._out_channels,
+                kernel_size=(self._kernel_size // 2 + 1, 1),
+                padding=(self._padding + 1, 0),
+            )
         self._vstack_1x1 = nn.Conv2d(
             in_channels=in_channels, out_channels=2 * out_channels, kernel_size=1
         )
@@ -113,7 +126,13 @@ class GatedPixelCNNLayer(nn.Module):
 
         # Compute vertical stack.
         vstack = self._vstack_Nx1(self._vstack_1xN(vstack_input))[:, :, :h, :]
-        link = self._link(vstack)
+        
+        # fix: here is where the correct implementation does the shift down (when shift_link_only true)
+        if self._shift_link_only:
+            link = self._link(nn.functional.pad(vstack, (0, 0, 1, 0))[:, :, :h, :])
+        else:
+            link = self._link(vstack)
+
         vstack = vstack + self._vstack_1x1(vstack_input)
         vstack = self._activation(vstack)
 
@@ -141,6 +160,7 @@ class GatedPixelCNN(base.AutoregressiveModel):
         gated_channels=128,
         head_channels=32,
         sample_fn=None,
+        shift_link_only=False
     ):
         """Initializes a new GatedPixelCNN instance.
 
@@ -152,6 +172,7 @@ class GatedPixelCNN(base.AutoregressiveModel):
             head_channels: The number of channels to use in the 1x1 convolution blocks
                 in the head after all the gated channels.
             sample_fn: See the base class.
+            shift_link_only: Gated PixelCNN blind spot fix
         """
         super().__init__(sample_fn)
         self._input = GatedPixelCNNLayer(
@@ -159,18 +180,37 @@ class GatedPixelCNN(base.AutoregressiveModel):
             out_channels=gated_channels,
             kernel_size=7,
             mask_center=True,
+            shift_link_only=shift_link_only
         )
-        self._gated_layers = nn.ModuleList(
-            [
-                GatedPixelCNNLayer(
-                    in_channels=gated_channels,
-                    out_channels=gated_channels,
-                    kernel_size=3,
-                    mask_center=False,
-                )
-                for _ in range(n_gated)
-            ]
-        )
+
+        # when the blind spot fix is enabled, the kernel size of the gated layers needs to increase to 5 to keep the prior behavior of being able to climb two rows (instead of just one)
+        if shift_link_only:
+            self._gated_layers = nn.ModuleList(
+                    [
+                        GatedPixelCNNLayer(
+                            in_channels=gated_channels,
+                            out_channels=gated_channels,
+                            kernel_size=5,
+                            mask_center=False,
+                            shift_link_only=shift_link_only
+                        )
+                        for _ in range(n_gated)
+                    ]
+            )
+        else:
+            self._gated_layers = nn.ModuleList(
+                    [
+                        GatedPixelCNNLayer(
+                            in_channels=gated_channels,
+                            out_channels=gated_channels,
+                            kernel_size=3,
+                            mask_center=False,
+                            shift_link_only=shift_link_only
+                        )
+                        for _ in range(n_gated)
+                    ]
+            )
+
         self._head = nn.Sequential(
             nn.ReLU(),
             nn.Conv2d(
